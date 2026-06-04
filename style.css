@@ -1,0 +1,137 @@
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #1a1a2e;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+.calculator {
+  width: 320px;
+  background: #16213e;
+  border-radius: 24px;
+  overflow: hidden;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.5);
+}
+
+.display {
+  padding: 24px 20px 16px;
+  text-align: right;
+  min-height: 100px;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  gap: 4px;
+}
+
+.expression {
+  color: #8892a4;
+  font-size: 15px;
+  min-height: 20px;
+  word-break: break-all;
+}
+
+.result {
+  color: #ffffff;
+  font-size: 48px;
+  font-weight: 300;
+  letter-spacing: -1px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.result.small {
+  font-size: 32px;
+}
+
+.buttons {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 1px;
+  background: #0d0d1a;
+  padding: 1px;
+}
+
+.btn {
+  background: #1e2d45;
+  color: #ffffff;
+  border: none;
+  padding: 0;
+  height: 72px;
+  font-size: 22px;
+  font-weight: 400;
+  cursor: pointer;
+  transition: background 0.1s, transform 0.08s;
+  user-select: none;
+}
+
+.btn:hover {
+  background: #253550;
+}
+
+.btn:active {
+  background: #2d3f63;
+  transform: scale(0.96);
+}
+
+.btn-wide {
+  grid-column: span 2;
+}
+
+.btn-op {
+  background: #e8a44a;
+  color: #ffffff;
+}
+
+.btn-op:hover {
+  background: #f0b55c;
+}
+
+.btn-op:active {
+  background: #f5c070;
+}
+
+.btn-op.active {
+  background: #ffffff;
+  color: #e8a44a;
+}
+
+.btn-equals {
+  background: #e8a44a;
+  color: #ffffff;
+}
+
+.btn-equals:hover {
+  background: #f0b55c;
+}
+
+.btn-equals:active {
+  background: #f5c070;
+}
+
+.btn-clear,
+.btn-toggle,
+.btn-mod {
+  background: #2e4060;
+  color: #a8d4f5;
+}
+
+.btn-clear:hover,
+.btn-toggle:hover,
+.btn-mod:hover {
+  background: #3a4f75;
+}
+
+.btn-clear:active,
+.btn-toggle:active,
+.btn-mod:active {
+  background: #455e88;
+}
