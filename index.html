@@ -1,0 +1,461 @@
+<!doctype html>
+<html lang="ta">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>வீட்டுக்கார அம்மா கணக்கு</title>
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <meta name="theme-color" content="#0f172a" />
+    <link rel="icon" href="/icons/icon-192.png" />
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- React & libs (UMD) -->
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xlsx@0.19.3/dist/xlsx.full.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/jspdf-autotable@3.8.2/dist/jspdf.plugin.autotable.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  </head>
+  <body class="bg-slate-100">
+    <div id="root"></div>
+    <script type="text/babel">
+    
+const { useEffect, useMemo, useState, useRef } = React;
+const { jsPDF } = window.jspdf;
+
+// Keys & helpers
+const USER_KEY = "vak-user-1";
+const keyForTxns = (phone) => `vak-transactions-${phone}`;
+const keyForCats = (phone) => `vak-categories-${phone}`;
+
+const OWNER_WHATSAPP_NUMBER = ""; // e.g., "9715XXXXXXXXX"
+const SIGNUP_WEBHOOK_URL = "";    // optional webhook
+
+function formatAmount(n, symbol) {
+  if (n === null || n === undefined || isNaN(n)) return `${symbol}0.00`;
+  const sign = n < 0 ? "-" : "";
+  const abs = Math.abs(Number(n)).toFixed(2);
+  return `${sign}${symbol}${abs}`;
+}
+
+function monthKeyFromDateStr(dateStr) {
+  const d = new Date(dateStr);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  return `${y}-${m}`;
+}
+
+const defaultCategories = [
+  "Groceries","Vegetables","Utilities","Transport","Medical","Education",
+  "Clothing","Entertainment","Household","Rent","Beauty Products","Other",
+];
+
+const currencyOptions = [
+  { code: "INR", symbol: "₹" },
+  { code: "AED", symbol: "د.إ" },
+  { code: "USD", symbol: "$" },
+];
+
+function App() {
+  const [user, setUser] = useState(null);
+  const [showSignup, setShowSignup] = useState(false);
+  const [transactions, setTransactions] = useState([]);
+  const [type, setType] = useState("debit");
+  const [amount, setAmount] = useState("");
+  const [date, setDate] = useState(() => new Date().toISOString().slice(0,10));
+  const [category, setCategory] = useState("Groceries");
+  const [note, setNote] = useState("");
+  const [editingId, setEditingId] = useState(null);
+  const [currency, setCurrency] = useState(currencyOptions[0]);
+  const [filterMonth, setFilterMonth] = useState(() => new Date().toISOString().slice(0,7));
+  const [search, setSearch] = useState("");
+  const [categories, setCategories] = useState(defaultCategories);
+  const [newCat, setNewCat] = useState("");
+  const [nameInput, setNameInput] = useState("");
+  const [phoneInput, setPhoneInput] = useState("");
+  const [shareConsent, setShareConsent] = useState(true);
+  const installPromptRef = useRef(null);
+  const [canInstall, setCanInstall] = useState(false);
+
+  // Manifest + SW (skip when hosted by oaiusercontent sandbox)
+  useEffect(() => {
+    if (!document.querySelector('link[rel="manifest"]')) {
+      const link = document.createElement('link');
+      link.rel = 'manifest';
+      link.href = '/manifest.webmanifest';
+      document.head.appendChild(link);
+    }
+    const isSandbox = location.hostname.includes('oaiusercontent.com');
+    if ('serviceWorker' in navigator && !isSandbox) {
+      const swUrl = '/sw.js';
+      (async () => {
+        try {
+          const res = await fetch(swUrl, { method: 'GET', cache: 'no-cache' });
+          if (res && res.ok) await navigator.serviceWorker.register(swUrl);
+        } catch (e) {}
+      })();
+    }
+  }, []);
+
+  // install prompt
+  useEffect(() => {
+    const handler = (e) => { e.preventDefault(); installPromptRef.current = e; setCanInstall(true); };
+    window.addEventListener('beforeinstallprompt', handler);
+    return () => window.removeEventListener('beforeinstallprompt', handler);
+  }, []);
+
+  // load user
+  useEffect(() => {
+    const raw = localStorage.getItem(USER_KEY);
+    if (raw) { try { setUser(JSON.parse(raw)); } catch {} } else { setShowSignup(true); }
+  }, []);
+
+  // load txns + currency when user set
+  useEffect(() => {
+    if (!user) { return; }
+    const raw = localStorage.getItem(keyForTxns(user.phone));
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw);
+        setTransactions(parsed.transactions || []);
+        if (parsed.currencyCode) {
+          const found = currencyOptions.find(c => c.code === parsed.currencyCode);
+          if (found) setCurrency(found);
+        }
+      } catch {}
+    } else { setTransactions([]); }
+  }, [user]);
+
+  // load categories
+  useEffect(() => {
+    if (!user) { return; }
+    const raw = localStorage.getItem(keyForCats(user.phone));
+    if (raw) {
+      try { const arr = JSON.parse(raw); if (Array.isArray(arr) && arr.length) setCategories(arr); } catch {}
+    } else { setCategories(defaultCategories); }
+  }, [user]);
+
+  // persist categories
+  useEffect(() => {
+    if (!user) { return; }
+    localStorage.setItem(keyForCats(user.phone), JSON.stringify(categories));
+  }, [categories, user]);
+
+  // ensure category exists
+  useEffect(() => {
+    if (!categories.includes(category)) setCategory(categories[0] || "");
+  }, [categories]);
+
+  // persist txns
+  useEffect(() => {
+    if (!user) { return; }
+    localStorage.setItem(keyForTxns(user.phone), JSON.stringify({ transactions, currencyCode: currency.code }));
+  }, [transactions, currency, user]);
+
+  const sortedTxns = useMemo(() => {
+    const filtered = transactions.filter(t =>
+      monthKeyFromDateStr(t.date) === filterMonth &&
+      [t.category, t.note, t.type, String(t.amount)].some(x => String(x || "").toLowerCase().includes(search.toLowerCase()))
+    );
+    return filtered.sort((a,b) => new Date(b.date) - new Date(a.date));
+  }, [transactions, filterMonth, search]);
+
+  const totals = useMemo(() => {
+    const totalCredit = transactions.filter(t => t.type === "credit").reduce((s,t)=>s+Number(t.amount||0),0);
+    const totalDebit  = transactions.filter(t => t.type === "debit").reduce((s,t)=>s+Number(t.amount||0),0);
+    return { totalCredit, totalDebit, balance: totalCredit - totalDebit };
+  }, [transactions]);
+
+  const monthStats = useMemo(() => {
+    const byMonth = (ym) => transactions.filter(t => monthKeyFromDateStr(t.date) === ym);
+    const current = byMonth(filterMonth);
+    const [y,m] = filterMonth.split("-").map(Number);
+    const prev = m === 1 ? `${y-1}-12` : `${y}-${String(m-1).padStart(2,"0")}`;
+    const prevList = byMonth(prev);
+    const curSpend = current.filter(t=>t.type==="debit").reduce((s,t)=>s+Number(t.amount||0),0);
+    const prevSpend = prevList.filter(t=>t.type==="debit").reduce((s,t)=>s+Number(t.amount||0),0);
+    const diff = curSpend - prevSpend;
+    const pct = prevSpend>0 ? (diff/prevSpend)*100 : null;
+    const catMap = {};
+    current.filter(t=>t.type==="debit").forEach(t => { const k = t.category || "Other"; catMap[k] = (catMap[k]||0)+Number(t.amount||0); });
+    const catArr = Object.entries(catMap).map(([name,value])=>({name,value})).sort((a,b)=>b.value-a.value);
+    return { curSpend, prevSpend, diff, pct, catArr, prevKey: prev };
+  }, [transactions, filterMonth]);
+
+  const allMonths = useMemo(() => {
+    const set = new Set(transactions.map(t=>monthKeyFromDateStr(t.date)));
+    set.add(new Date().toISOString().slice(0,7));
+    return Array.from(set).sort().reverse();
+  }, [transactions]);
+
+  function resetForm(){
+    setType("debit"); setAmount(""); setDate(new Date().toISOString().slice(0,10)); setCategory(categories[0]||""); setNote(""); setEditingId(null);
+  }
+
+  function handleSave(e){
+    e.preventDefault();
+    const amt = parseFloat(amount);
+    if (!(amt>0)) { alert("Please enter a valid amount greater than 0."); return; }
+    if (!date) { alert("Please choose a date."); return; }
+    if (editingId) {
+      setTransactions(prev => prev.map(t => t.id===editingId ? {...t, type, amount:amt, date, category, note} : t));
+    } else {
+      setTransactions(prev => [...prev, { id: Date.now().toString(36)+Math.random().toString(36).slice(2,7), type, amount:amt, date, category, note }]);
+    }
+    resetForm();
+  }
+
+  function handleEdit(t){ setEditingId(t.id); setType(t.type); setAmount(String(t.amount)); setDate(t.date); setCategory(t.category||""); setNote(t.note||""); }
+  function handleDelete(id){ if (confirm("Delete this entry?")) setTransactions(prev => prev.filter(t=>t.id!==id)); }
+
+  async function notifyOwnerOfSignup(u){
+    const msg = `VAK signup: Name=${u.name}, Phone=${u.phone}, Time=${new Date(u.createdAt).toLocaleString()}`;
+    try{
+      if (SIGNUP_WEBHOOK_URL){
+        await fetch(SIGNUP_WEBHOOK_URL, {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({source:"VAK", user:u})});
+      }
+    }catch(e){}
+    if (OWNER_WHATSAPP_NUMBER){
+      const wa = `https://wa.me/${OWNER_WHATSAPP_NUMBER}?text=${encodeURIComponent(msg)}`;
+      window.open(wa, "_blank");
+    }
+    try{ await navigator.clipboard.writeText(msg);}catch(e){}
+  }
+
+  function handleInstall(){
+    const evt = installPromptRef.current;
+    if (evt) { evt.prompt(); evt.userChoice.finally(()=>setCanInstall(false)); }
+    else { alert('On iPhone, open in Safari → Share → Add to Home Screen'); }
+  }
+
+  function exportExcel(){
+    const rows = transactions.slice().sort((a,b)=>new Date(a.date)-new Date(b.date)).map(t=>({Date:t.date, Type:t.type, Amount:t.amount, Category:t.category, Note:t.note}));
+    const summary = [{},{Summary:"Total Credit",Value:totals.totalCredit},{Summary:"Total Debit",Value:totals.totalDebit},{Summary:"Balance",Value:totals.balance}];
+    const wb = XLSX.utils.book_new();
+    const ws1 = XLSX.utils.json_to_sheet(rows); XLSX.utils.book_append_sheet(wb, ws1, "Transactions");
+    const ws2 = XLSX.utils.json_to_sheet(summary); XLSX.utils.book_append_sheet(wb, ws2, "Summary");
+    const ws3 = XLSX.utils.json_to_sheet([{Field:"Name",Value:user?.name||""},{Field:"Phone",Value:user?.phone||""}]); XLSX.utils.book_append_sheet(wb, ws3, "Profile");
+    XLSX.writeFile(wb, "Veettukara_Amma_Kanakku.xlsx");
+  }
+
+  function exportPDF(){
+    const doc = new jsPDF({ unit:"pt", format:"a4" });
+    const margin = 40;
+    doc.setFontSize(16); doc.text("வீட்டுக்கார அம்மா கணக்கு — Transactions", margin, 40);
+    doc.setFontSize(11); doc.text(`User: ${user?.name||""} | Phone: ${user?.phone||""}`, margin, 60);
+    doc.setFontSize(11);
+    doc.text(`Total Credit: ${formatAmount(totals.totalCredit, currency.symbol)} | Total Debit: ${formatAmount(totals.totalDebit, currency.symbol)} | Balance: ${formatAmount(totals.balance, currency.symbol)}`, margin, 80);
+    const headers = [["Date","Type","Amount","Category","Note"]];
+    const body = transactions.slice().sort((a,b)=>new Date(a.date)-new Date(b.date)).map(t=>[t.date, t.type, `${currency.symbol}${Number(t.amount).toFixed(2)}`, t.category||"", t.note||""]);
+    if (doc.autoTable) doc.autoTable({ head: headers, body, startY: 100, styles:{fontSize:10, cellPadding:4}, headStyles:{fillColor:[25,118,210]}, margin:{left:margin, right:margin} });
+    doc.save("Veettukara_Amma_Kanakku.pdf");
+  }
+
+  const topCats = monthStats(catData(transactions, filterMonth)).slice(0,5);
+  function catData(trans, ym){
+    const current = trans.filter(t=>monthKeyFromDateStr(t.date)===ym && t.type==='debit');
+    const map = {}; current.forEach(t=>{ map[t.category||'Other']=(map[t.category||'Other']||0)+Number(t.amount||0); });
+    return Object.entries(map).map(([name,value])=>({name,value})).sort((a,b)=>b.value-a.value);
+  }
+  function monthStats(catArr){ return catArr; } // simple passthrough for bar width calc
+  const maxVal = Math.max(1, ...topCats.map(c=>c.value));
+
+  // Signup screen
+  if (!user || showSignup){
+    return (
+      <div className="min-h-screen bg-slate-900/5 flex justify-center">
+        <div className="w-full max-w-[430px] aspect-[9/16] bg-slate-50 shadow-2xl overflow-auto grid place-items-center p-6">
+          <div className="bg-white rounded-2xl p-6 w-full max-w-md shadow">
+            <h1 className="text-xl font-bold mb-1">வீட்டுக்கார அம்மா கணக்கு</h1>
+            <p className="text-xs text-slate-500 mb-4">Sign up to start</p>
+            <div className="grid gap-3">
+              <div>
+                <label className="text-sm text-slate-600">Name</label>
+                <input value={nameInput} onChange={(e)=>setNameInput(e.target.value)} className="w-full mt-1 px-3 py-2 rounded-xl border border-slate-300" placeholder="Your name" />
+              </div>
+              <div>
+                <label className="text-sm text-slate-600">Phone</label>
+                <input type="tel" value={phoneInput} onChange={(e)=>setPhoneInput(e.target.value)} className="w-full mt-1 px-3 py-2 rounded-xl border border-slate-300" placeholder="+9715…" />
+              </div>
+              <label className="flex items-center gap-2 text-xs text-slate-600">
+                <input type="checkbox" checked={shareConsent} onChange={(e)=>setShareConsent(e.target.checked)} />
+                Share my details with owner (WhatsApp/webhook)
+              </label>
+              <div className="flex gap-2 justify-end pt-1">
+                {user && <button type="button" onClick={()=>setShowSignup(false)} className="px-3 py-2 rounded-xl border">Cancel</button>}
+                <button type="button" onClick={()=>{
+                  const name = (nameInput||'').trim();
+                  const phoneDigits = (phoneInput||'').replace(/\\D/g,'');
+                  if (name.length < 2) { alert('Please enter a valid name'); return; }
+                  if (phoneDigits.length < 7 || phoneDigits.length > 15) { alert('Please enter a valid phone number'); return; }
+                  const newUser = { name, phone: phoneDigits, createdAt: new Date().toISOString() };
+                  localStorage.setItem(USER_KEY, JSON.stringify(newUser));
+                  setUser(newUser);
+                  if (shareConsent) { notifyOwnerOfSignup(newUser); }
+                  setShowSignup(false);
+                }} className="px-3 py-2 rounded-xl bg-slate-900 text-white">Save</button>
+              </div>
+              <p className="text-[11px] text-slate-400">Note: Your profile and data are saved only on this device.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Main app
+  return (
+    <div className="min-h-screen bg-slate-900/5 flex justify-center">
+      <div className="w-full max-w-[430px] aspect-[9/16] bg-slate-50 text-slate-800 shadow-2xl overflow-hidden">
+        <header className="sticky top-0 z-10 bg-white/80 backdrop-blur border-b border-slate-200">
+          <div className="px-4 py-3 flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <div className="h-10 w-10 rounded-2xl bg-slate-900 text-white grid place-items-center font-bold">வ</div>
+              <div>
+                <h1 className="text-xl font-bold">வீட்டுக்கார அம்மா கணக்கு</h1>
+                <p className="text-xs text-slate-500">Powered by Mubsa Group</p>
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <a href="/portfolio.html" className="px-3 py-2 rounded-xl bg-emerald-700 hover:bg-emerald-600 text-white text-sm font-semibold shadow">📈 Portfolio</a>
+              {canInstall && <button onClick={handleInstall} className="px-3 py-2 rounded-xl border text-sm">Install App</button>}
+              {user && <div className="hidden sm:block text-right mr-2">
+                <div className="text-xs text-slate-500">User</div>
+                <div className="text-sm font-medium">{user.name}</div>
+                <div className="text-[10px] text-slate-500">{user.phone}</div>
+              </div>}
+              <button onClick={()=>{setNameInput(user?.name||""); setPhoneInput(user?.phone||""); setShowSignup(true);}} className="px-3 py-2 rounded-xl border text-sm">Profile</button>
+              <button onClick={()=> user && notifyOwnerOfSignup(user)} className="px-3 py-2 rounded-xl border text-sm">Share details</button>
+              <select value={currency.code} onChange={(e)=>{const c=currencyOptions.find(x=>x.code===e.target.value); if(c) setCurrency(c);}} className="px-3 py-2 rounded-xl border border-slate-300 bg-white text-sm" aria-label="Currency">
+                {currencyOptions.map(c => <option key={c.code} value={c.code}>{c.symbol} {c.code}</option>)}
+              </select>
+              <button onClick={exportExcel} className="px-3 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-sm shadow">Export Excel</button>
+              <button onClick={exportPDF} className="px-3 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-sm shadow">Export PDF</button>
+            </div>
+          </div>
+        </header>
+
+        <main className="h-full overflow-y-auto px-4 py-4 grid gap-4">
+          <section className="grid grid-cols-3 gap-4">
+            <div className="p-4 rounded-2xl bg-white shadow-sm border">
+              <p className="text-sm text-slate-500">Total Credit</p>
+              <p className="text-2xl font-bold mt-1">{formatAmount(transactions.filter(t=>t.type==='credit').reduce((s,t)=>s+Number(t.amount||0),0), currency.symbol)}</p>
+            </div>
+            <div className="p-4 rounded-2xl bg-white shadow-sm border">
+              <p className="text-sm text-slate-500">Total Debit</p>
+              <p className="text-2xl font-bold mt-1">{formatAmount(transactions.filter(t=>t.type==='debit').reduce((s,t)=>s+Number(t.amount||0),0), currency.symbol)}</p>
+            </div>
+            <div className={`p-4 rounded-2xl shadow-sm border ${ (transactions.filter(t=>t.type==='credit').reduce((s,t)=>s+Number(t.amount||0),0) - transactions.filter(t=>t.type==='debit').reduce((s,t)=>s+Number(t.amount||0),0)) >= 0 ? "bg-emerald-50 border-emerald-200" : "bg-rose-50 border-rose-200"}`}>
+              <p className="text-sm text-slate-500">Available Balance</p>
+              <p className="text-2xl font-extrabold mt-1">{formatAmount(
+                transactions.filter(t=>t.type==='credit').reduce((s,t)=>s+Number(t.amount||0),0) - transactions.filter(t=>t.type==='debit').reduce((s,t)=>s+Number(t.amount||0),0)
+              , currency.symbol)}</p>
+            </div>
+          </section>
+
+          <section className="bg-white rounded-2xl p-4 shadow-sm border">
+            <h2 className="text-lg font-semibold mb-4">{editingId ? "Edit Entry" : "Add New Entry"}</h2>
+            <form onSubmit={handleSave} className="grid grid-cols-6 gap-3">
+              <div className="col-span-2">
+                <label className="text-sm text-slate-600">Type</label>
+                <select value={type} onChange={(e)=>setType(e.target.value)} className="w-full mt-1 px-3 py-2 rounded-xl border border-slate-300 bg-white">
+                  <option value="credit">Credit (Money In)</option>
+                  <option value="debit">Debit (Money Out)</option>
+                </select>
+              </div>
+              <div className="col-span-2">
+                <label className="text-sm text-slate-600">Amount</label>
+                <input type="number" step="0.01" min="0" required value={amount} onChange={(e)=>setAmount(e.target.value)} className="w-full mt-1 px-3 py-2 rounded-xl border border-slate-300" placeholder="0.00" />
+              </div>
+              <div className="col-span-2">
+                <label className="text-sm text-slate-600">Date</label>
+                <input type="date" required value={date} onChange={(e)=>setDate(e.target.value)} className="w-full mt-1 px-3 py-2 rounded-xl border border-slate-300" />
+              </div>
+              <div className="col-span-3">
+                <label className="text-sm text-slate-600">Category</label>
+                <select value={category} onChange={(e)=>setCategory(e.target.value)} className="w-full mt-1 px-3 py-2 rounded-xl border border-slate-300 bg-white">
+                  {categories.map(c => <option value={c} key={c}>{c}</option>)}
+                </select>
+                <div className="flex gap-2 mt-2">
+                  <input value={newCat} onChange={(e)=>setNewCat(e.target.value)} className="flex-1 px-3 py-2 rounded-xl border border-slate-300" placeholder="Add new category…" />
+                  <button type="button" onClick={()=>{
+                    const name = (newCat||'').trim(); if(!name) return;
+                    const exists = categories.some(c=>c.toLowerCase()===name.toLowerCase());
+                    if (exists){ alert('Category already exists'); return; }
+                    setCategories(prev=>[...prev, name]); setCategory(name); setNewCat('');
+                  }} className="px-3 py-2 rounded-xl border bg-slate-50 hover:bg-slate-100">Add</button>
+                </div>
+              </div>
+              <div className="col-span-3">
+                <label className="text-sm text-slate-600">Note (optional)</label>
+                <input value={note} onChange={(e)=>setNote(e.target.value)} className="w-full mt-1 px-3 py-2 rounded-xl border border-slate-300" placeholder="Eg. Vegetables @ Lulu" />
+              </div>
+              <div className="col-span-6 flex gap-2 mt-1">
+                <button type="submit" className="px-4 py-2 rounded-xl bg-slate-900 text-white hover:bg-black shadow">{editingId ? "Update" : "Save"}</button>
+                {editingId && <button type="button" onClick={resetForm} className="px-4 py-2 rounded-xl border hover:bg-slate-50">Cancel</button>}
+                <button type="button" onClick={()=>{ if (confirm('This will erase all data. Continue?')) setTransactions([]); }} className="ml-auto px-4 py-2 rounded-xl border hover:bg-rose-50" title="Clear all data">Reset</button>
+              </div>
+            </form>
+          </section>
+
+          <section className="grid grid-cols-3 gap-4">
+            <div className="bg-white rounded-2xl p-4 shadow-sm border">
+              <label className="text-sm text-slate-600">View Month</label>
+              <select value={filterMonth} onChange={(e)=>setFilterMonth(e.target.value)} className="w-full mt-1 px-3 py-2 rounded-xl border border-slate-300">
+                {Array.from(new Set([ ...transactions.map(t=>monthKeyFromDateStr(t.date)), new Date().toISOString().slice(0,7) ])).sort().reverse().map(m => <option key={m} value={m}>{m}</option>)}
+              </select>
+            </div>
+            <div className="bg-white rounded-2xl p-4 shadow-sm border col-span-2">
+              <label className="text-sm text-slate-600">Search</label>
+              <input value={search} onChange={(e)=>setSearch(e.target.value)} placeholder="Type to search amount, category, note…" className="w-full mt-1 px-3 py-2 rounded-xl border border-slate-300" />
+            </div>
+          </section>
+
+          <section className="bg-white rounded-2xl p-4 shadow-sm border">
+            <div className="flex items-center justify-between">
+              <h2 className="text-lg font-semibold">Transactions — {filterMonth}</h2>
+              <p className="text-sm text-slate-500">{sortedTxns.length} item(s)</p>
+            </div>
+            <div className="overflow-x-auto mt-3">
+              <table className="min-w-full text-sm">
+                <thead><tr className="text-left text-slate-500 border-b">
+                  <th className="py-2 pr-4">Date</th><th className="py-2 pr-4">Type</th><th className="py-2 pr-4">Amount</th><th className="py-2 pr-4">Category</th><th className="py-2 pr-4">Note</th><th className="py-2 pr-4">Actions</th>
+                </tr></thead>
+                <tbody>
+                  {sortedTxns.length===0 && <tr><td colSpan={6} className="py-8 text-center text-slate-500">No entries yet. Add from above form.</td></tr>}
+                  {sortedTxns.map(t => (
+                    <tr key={t.id} className="border-b last:border-0">
+                      <td className="py-2 pr-4 whitespace-nowrap">{t.date}</td>
+                      <td className={`py-2 pr-4 font-medium ${t.type==="credit" ? "text-emerald-700" : "text-rose-700"}`}>{t.type}</td>
+                      <td className="py-2 pr-4">{formatAmount(t.type==='credit' ? t.amount : -t.amount, currency.symbol)}</td>
+                      <td className="py-2 pr-4">{t.category}</td>
+                      <td className="py-2 pr-4 max-w-[24ch] truncate" title={t.note}>{t.note}</td>
+                      <td className="py-2 pr-4">
+                        <div className="flex items-center gap-2">
+                          <button onClick={()=>handleEdit(t)} className="px-2 py-1 rounded-lg border hover:bg-slate-50" title="Edit">✏️</button>
+                          <button onClick={()=>handleDelete(t.id)} className="px-2 py-1 rounded-lg border hover:bg-rose-50" title="Delete">🗑️</button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          <section className="text-xs text-slate-500 px-1">
+            <p>Tip: Use <span className="font-mono">Export Excel</span> for full data backup, and <span className="font-mono">Export PDF</span> to share a summary. Your data is stored only in this browser (localStorage).</p>
+          </section>
+        </main>
+
+        <footer className="py-6 text-center text-xs text-slate-500">Built with ❤️ for simple family budgeting.</footer>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+
+    </script>
+  </body>
+</html>
