@@ -32,46 +32,52 @@ class ErrBound extends React.Component {
   static getDerivedStateFromError(err) { return { err }; }
   render() {
     if (this.state.err) {
-      return (
-        <div style={{color:'#f87171',padding:'2rem',fontFamily:'monospace'}}>
-          <b>Render error:</b> {String(this.state.err)}
-        </div>
-      );
+      return <div style={{color:'#f87171',padding:'2rem',fontFamily:'monospace'}}><b>Error:</b> {String(this.state.err)}</div>;
     }
     return this.props.children;
   }
 }
 
 // ─── Constants ──────────────────────────────────────────────────────────────
-const TXN_KEY    = 'wpt-v1-txns';
-const PRICE_KEY  = 'wpt-v1-prices';
+const TXN_KEY   = 'wpt-v1-txns';
+const PRICE_KEY = 'wpt-v1-prices';
 
 const MARKETS = [
-  { id: 'IN_STOCK', label: 'Indian Stock (NSE)', currency: '₹', hint: 'RELIANCE.NS' },
-  { id: 'IN_BSE',   label: 'Indian Stock (BSE)', currency: '₹', hint: 'RELIANCE.BO' },
-  { id: 'IN_ETF',   label: 'Indian ETF (NSE)',   currency: '₹', hint: 'NIFTYBEES.NS' },
-  { id: 'IN_MF',    label: 'Indian Mutual Fund', currency: '₹', hint: '120503 (scheme code)' },
+  { id: 'IN_STOCK', label: 'Indian Stock (NSE)', currency: '₹', hint: 'RELIANCE or RELIANCE.NS' },
+  { id: 'IN_BSE',   label: 'Indian Stock (BSE)', currency: '₹', hint: 'RELIANCE or RELIANCE.BO' },
+  { id: 'IN_ETF',   label: 'Indian ETF (NSE)',   currency: '₹', hint: 'NIFTYBEES or NIFTYBEES.NS' },
+  { id: 'IN_MF',    label: 'Indian Mutual Fund', currency: '₹', hint: '120503 (MF scheme code)' },
   { id: 'US_STOCK', label: 'US Stock / ETF',     currency: '$', hint: 'AAPL' },
 ];
 
 function market(id) { return MARKETS.find(m => m.id === id) ?? MARKETS[0]; }
 function today()    { return new Date().toISOString().slice(0, 10); }
 
+// Auto-append exchange suffix so users can type RELIANCE instead of RELIANCE.NS
+function normalizeTicker(ticker, marketId) {
+  const t = (ticker || '').trim().toUpperCase();
+  if (!t || marketId === 'IN_MF' || marketId === 'US_STOCK') return t;
+  if (t.includes('.')) return t;
+  if (marketId === 'IN_BSE') return t + '.BO';
+  return t + '.NS'; // IN_STOCK, IN_ETF
+}
+
 // ─── Number formatting ────────────────────────────────────────────────────
-function fmt(n, dec = 2) {
+function fmt(n, dec) {
+  dec = dec == null ? 2 : dec;
   if (n == null || isNaN(n)) return '—';
   return Number(n).toLocaleString('en-IN', { minimumFractionDigits: dec, maximumFractionDigits: dec });
 }
-function cur(n, sym, dec = 2) {
-  sym = sym || '₹';
+function cur(n, sym, dec) {
+  sym = sym || '₹'; dec = dec == null ? 2 : dec;
   if (n == null || isNaN(n)) return '—';
-  const abs = Math.abs(n);
-  return (n < 0 ? '-' : '') + sym + abs.toLocaleString('en-IN', { minimumFractionDigits: dec, maximumFractionDigits: dec });
+  return (n < 0 ? '-' : '') + sym + Math.abs(n).toLocaleString('en-IN', { minimumFractionDigits: dec, maximumFractionDigits: dec });
 }
 function qty(n) { return fmt(n, n % 1 === 0 ? 0 : 3); }
 function sign(n) { return n >= 0 ? '+' : ''; }
 
-// ─── Market data fetching ────────────────────────────────────────────────
+// ─── Market data fetching ─────────────────────────────────────────────────
+
 async function timedFetch(url, ms) {
   ms = ms || 8000;
   const ctrl = new AbortController();
@@ -80,6 +86,52 @@ async function timedFetch(url, ms) {
   finally { clearTimeout(id); }
 }
 
+// Stooq: CORS-free CSV endpoint — primary source for stocks/ETFs
+// URL: https://stooq.com/q/l/?s=reliance.ns&f=sd2t2ohlcv&h&e=csv
+// CSV columns: Symbol, Date, Time, Open, High, Low, Close, Volume
+async function fetchStooqPrice(ticker, marketId) {
+  let s = ticker.toLowerCase();
+  if (marketId === 'US_STOCK' && !s.includes('.')) s += '.us';
+  const url = 'https://stooq.com/q/l/?s=' + encodeURIComponent(s) + '&f=sd2t2ohlcv&h&e=csv';
+  const res = await timedFetch(url, 9000);
+  if (!res.ok) throw new Error('Stooq HTTP ' + res.status);
+  const text = await res.text();
+  const rows = text.trim().split('\n');
+  if (rows.length < 2) throw new Error('Stooq: no data');
+  const cols = rows[1].split(',');
+  const price = parseFloat(cols[6]); // Close column
+  if (!price || isNaN(price) || price <= 0) throw new Error('Stooq: ticker not found or market closed');
+  return { price, name: null };
+}
+
+// Yahoo Finance via CORS proxies — used for name lookup + fallback price
+async function fetchYahooQuote(ticker) {
+  const yahooUrl = 'https://query2.finance.yahoo.com/v8/finance/chart/' + encodeURIComponent(ticker) + '?interval=1d&range=1d';
+  const attempts = [
+    'https://api.allorigins.win/raw?url=' + encodeURIComponent(yahooUrl),
+    'https://corsproxy.io/?url=' + encodeURIComponent(yahooUrl),
+    'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(yahooUrl),
+    yahooUrl, // direct last (works in some environments)
+  ];
+  let lastErr = 'All proxies failed';
+  for (const url of attempts) {
+    try {
+      const res = await timedFetch(url, 8000);
+      if (!res.ok) { lastErr = 'HTTP ' + res.status; continue; }
+      const d = await res.json();
+      const result = d && d.chart && d.chart.result && d.chart.result[0];
+      const price = result && result.meta && result.meta.regularMarketPrice;
+      if (!price) { lastErr = 'No price in response'; continue; }
+      return {
+        price,
+        name: (result.meta.shortName || result.meta.longName || null),
+      };
+    } catch (e) { lastErr = e.message; continue; }
+  }
+  throw new Error(lastErr);
+}
+
+// Indian Mutual Fund NAV via mfapi.in (CORS-free)
 async function fetchMFPrice(schemeCode) {
   const res = await timedFetch('https://api.mfapi.in/mf/' + encodeURIComponent(schemeCode) + '/latest');
   if (!res.ok) throw new Error('MFapi HTTP ' + res.status);
@@ -89,26 +141,31 @@ async function fetchMFPrice(schemeCode) {
   return { price: parseFloat(nav), name: (d.meta && d.meta.scheme_name) || null };
 }
 
-async function fetchYahooPrice(ticker) {
-  const url = 'https://query2.finance.yahoo.com/v8/finance/chart/' + encodeURIComponent(ticker) + '?interval=1d&range=1d';
-  let res;
-  try {
-    res = await timedFetch(url, 6000);
-  } catch (_) {
-    const proxy = 'https://corsproxy.io/?url=' + encodeURIComponent(url);
-    res = await timedFetch(proxy, 10000);
-  }
-  if (!res.ok) throw new Error('Yahoo HTTP ' + res.status);
-  const d = await res.json();
-  const result = d && d.chart && d.chart.result && d.chart.result[0];
-  const price = result && result.meta && result.meta.regularMarketPrice;
-  if (!price) throw new Error('Price not in response');
-  return { price, name: (result && result.meta && result.meta.shortName) || null };
-}
-
+// Main entry: Stooq (price) + Yahoo proxy (name fallback) + MF API
 async function fetchPrice(ticker, marketId) {
   if (marketId === 'IN_MF') return fetchMFPrice(ticker);
-  return fetchYahooPrice(ticker);
+
+  let stooqPrice = null;
+  let yahooResult = null;
+
+  // Run both in parallel for speed
+  const [stooqSettled, yahooSettled] = await Promise.allSettled([
+    fetchStooqPrice(ticker, marketId),
+    fetchYahooQuote(ticker),
+  ]);
+
+  if (stooqSettled.status === 'fulfilled') stooqPrice = stooqSettled.value;
+  if (yahooSettled.status === 'fulfilled') yahooResult = yahooSettled.value;
+
+  if (stooqPrice && yahooResult) {
+    // Stooq price is reliable (EOD); Yahoo price may be real-time — prefer Yahoo price
+    return { price: yahooResult.price, name: yahooResult.name };
+  }
+  if (yahooResult) return yahooResult;
+  if (stooqPrice)  return stooqPrice;
+
+  // Both failed — surface the Stooq error (more informative)
+  throw new Error(stooqSettled.reason ? String(stooqSettled.reason.message) : 'Price unavailable — set manually');
 }
 
 // ─── Portfolio computation ───────────────────────────────────────────────
@@ -116,15 +173,15 @@ function computeHoldings(txns) {
   const map = {};
   const sorted = [...txns].sort((a, b) => new Date(a.date) - new Date(b.date));
   for (const t of sorted) {
-    if (!map[t.ticker]) map[t.ticker] = { ticker: t.ticker, name: t.assetName, marketId: t.marketId, qty: 0, cost: 0, avgBuy: 0 };
-    const h = map[t.ticker];
+    const key = t.ticker;
+    if (!map[key]) map[key] = { ticker: key, name: t.assetName, marketId: t.marketId, qty: 0, cost: 0, avgBuy: 0 };
+    const h = map[key];
     if (t.type === 'Buy') {
       h.cost += t.qty * t.price;
       h.qty  += t.qty;
     } else {
-      const costReduced = t.qty * h.avgBuy;
-      h.cost = Math.max(0, h.cost - costReduced);
-      h.qty -= t.qty;
+      h.cost = Math.max(0, h.cost - t.qty * h.avgBuy);
+      h.qty  -= t.qty;
     }
     h.avgBuy   = h.qty > 0 ? h.cost / h.qty : 0;
     h.name     = t.assetName;
@@ -134,35 +191,31 @@ function computeHoldings(txns) {
 }
 
 // ─── Sub-components ──────────────────────────────────────────────────────
-function PLBadge({ value, pct, sym, size }) {
+function PLBadge({ value, sym, size }) {
   size = size || 'sm';
   const pos   = value >= 0;
-  const arrow = pos ? '▲' : '▼';
   const col   = pos ? 'text-emerald-400' : 'text-rose-400';
   const bg    = pos ? 'bg-emerald-950 border-emerald-800' : 'bg-rose-950 border-rose-800';
   const big   = size === 'lg';
-  const outer = 'inline-flex items-center gap-1 border rounded-full num font-semibold ' + (big ? 'px-3 py-1 text-base ' : 'px-2 py-0.5 text-xs ') + col + ' ' + bg;
   return (
-    <span className={outer}>
-      <span className={big ? 'text-sm' : 'text-[10px]'}>{arrow}</span>
+    <span className={'inline-flex items-center gap-1 border rounded-full num font-semibold ' + (big ? 'px-3 py-1 text-base ' : 'px-2 py-0.5 text-xs ') + col + ' ' + bg}>
+      <span className={big ? 'text-sm' : 'text-[10px]'}>{pos ? '▲' : '▼'}</span>
       <span>{cur(Math.abs(value), sym)}</span>
-      {pct != null && <span className="opacity-70">({fmt(Math.abs(pct))}%)</span>}
     </span>
   );
 }
 
 function StatCard({ label, children, accent }) {
-  const cls = 'rounded-2xl border p-5 ' + (accent ? 'bg-slate-800 border-slate-600' : 'bg-slate-900 border-slate-800');
   return (
-    <div className={cls}>
+    <div className={'rounded-2xl border p-5 ' + (accent ? 'bg-slate-800 border-slate-600' : 'bg-slate-900 border-slate-800')}>
       <p className="text-xs uppercase tracking-widest text-slate-400 font-medium mb-2">{label}</p>
       {children}
     </div>
   );
 }
 
-function Spinner() {
-  return <span className="inline-block spin text-slate-400 text-lg leading-none">⟳</span>;
+function Spinner({ small }) {
+  return <span className={'inline-block spin text-slate-400 leading-none ' + (small ? 'text-sm' : 'text-lg')}>⟳</span>;
 }
 
 function EmptyState({ onAdd }) {
@@ -182,21 +235,45 @@ function EmptyState({ onAdd }) {
 const BLANK = { date: today(), assetName: '', ticker: '', marketId: 'IN_STOCK', type: 'Buy', qty: '', price: '', priority: 3 };
 
 function TxnModal({ initial, onSave, onClose }) {
-  const [f, setF] = useState(initial ?? BLANK);
+  const [f, setF]       = useState(initial ?? BLANK);
+  const [looking, setLooking] = useState(false);
+  const [lookMsg, setLookMsg] = useState('');
   const set = (k, v) => setF(p => Object.assign({}, p, { [k]: v }));
   const m = market(f.marketId);
   const total = parseFloat(f.qty) * parseFloat(f.price);
+
+  // Auto-lookup name + current price when user finishes typing ticker
+  async function lookupTicker() {
+    const ticker = normalizeTicker(f.ticker, f.marketId);
+    if (!ticker) return;
+    setLooking(true);
+    setLookMsg('');
+    try {
+      const result = await fetchPrice(ticker, f.marketId);
+      if (result.name && !f.assetName.trim()) {
+        set('assetName', result.name);
+      }
+      if (result.price && !f.price) {
+        set('price', String(result.price));
+      }
+      setLookMsg(result.name ? ('✓ ' + result.name) : '✓ price found');
+    } catch (e) {
+      setLookMsg('⚠ ' + e.message + ' — you can still enter manually');
+    }
+    setLooking(false);
+  }
 
   function submit(e) {
     e.preventDefault();
     const q = parseFloat(f.qty), p = parseFloat(f.price);
     if (!(q > 0) || !(p > 0)) { alert('Enter valid quantity and price.'); return; }
-    if (!f.ticker.trim())      { alert('Ticker / scheme code is required.'); return; }
+    const ticker = normalizeTicker(f.ticker, f.marketId);
+    if (!ticker) { alert('Ticker / scheme code is required.'); return; }
     onSave({
       id:        f.id ?? (Date.now().toString(36) + Math.random().toString(36).slice(2, 6)),
       date:      f.date,
-      assetName: (f.assetName.trim() || f.ticker.trim()).toUpperCase().replace(/\./g, ''),
-      ticker:    f.ticker.trim().toUpperCase(),
+      assetName: (f.assetName.trim() || ticker),
+      ticker,
       marketId:  f.marketId,
       type:      f.type,
       qty:       q,
@@ -206,82 +283,106 @@ function TxnModal({ initial, onSave, onClose }) {
   }
 
   const inputCls = "w-full px-3 py-2 rounded-lg bg-slate-800 border border-slate-700 text-white text-sm focus:outline-none focus:border-emerald-500";
-  const labelCls = "text-xs text-slate-400 uppercase tracking-wider font-medium";
+  const lblCls   = "text-xs text-slate-400 uppercase tracking-wider font-medium";
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-sm p-4" onClick={e => e.target === e.currentTarget && onClose()}>
       <div className="bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl w-full max-w-lg">
         <div className="flex items-center justify-between px-6 py-4 border-b border-slate-800">
           <h2 className="text-lg font-bold">{f.id ? 'Edit Transaction' : 'Add Transaction'}</h2>
-          <button onClick={onClose} className="text-slate-400 hover:text-white text-2xl leading-none transition-colors">×</button>
+          <button onClick={onClose} className="text-slate-400 hover:text-white text-2xl leading-none">×</button>
         </div>
 
         <form onSubmit={submit} className="p-6 space-y-4">
+          {/* Date + Market */}
           <div className="grid grid-cols-2 gap-3">
             <label className="space-y-1">
-              <span className={labelCls}>Date</span>
+              <span className={lblCls}>Date</span>
               <input type="date" required value={f.date} onChange={e => set('date', e.target.value)} className={inputCls} />
             </label>
             <label className="space-y-1">
-              <span className={labelCls}>Market</span>
-              <select value={f.marketId} onChange={e => set('marketId', e.target.value)} className={inputCls}>
+              <span className={lblCls}>Market</span>
+              <select value={f.marketId} onChange={e => { set('marketId', e.target.value); setLookMsg(''); }} className={inputCls}>
                 {MARKETS.map(mk => <option key={mk.id} value={mk.id}>{mk.label}</option>)}
               </select>
             </label>
           </div>
 
-          <div className="grid grid-cols-2 gap-3">
-            <label className="space-y-1">
-              <span className={labelCls}>Asset Name</span>
-              <input type="text" placeholder="e.g. Reliance Industries" value={f.assetName} onChange={e => set('assetName', e.target.value)} className={inputCls + ' placeholder-slate-600'} />
-            </label>
-            <label className="space-y-1">
-              <span className={labelCls}>{f.marketId === 'IN_MF' ? 'Scheme Code' : 'Ticker Symbol'}</span>
-              <input type="text" required placeholder={m.hint} value={f.ticker} onChange={e => set('ticker', e.target.value)} className={inputCls + ' font-mono placeholder-slate-600'} />
-            </label>
+          {/* Ticker with lookup */}
+          <div className="space-y-1">
+            <span className={lblCls}>{f.marketId === 'IN_MF' ? 'Scheme Code' : 'Ticker Symbol'}</span>
+            <div className="flex gap-2">
+              <input type="text" required placeholder={m.hint} value={f.ticker}
+                onChange={e => { set('ticker', e.target.value); setLookMsg(''); }}
+                onBlur={lookupTicker}
+                className={inputCls + ' font-mono placeholder-slate-600 flex-1'} />
+              <button type="button" onClick={lookupTicker} disabled={looking || !f.ticker.trim()}
+                className="px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 border border-slate-600 text-xs text-slate-300 whitespace-nowrap disabled:opacity-40 transition-colors">
+                {looking ? <Spinner small /> : 'Look up'}
+              </button>
+            </div>
+            {lookMsg && (
+              <p className={'text-xs mt-1 ' + (lookMsg.startsWith('⚠') ? 'text-amber-400' : 'text-emerald-400')}>{lookMsg}</p>
+            )}
+            {(f.marketId === 'IN_STOCK' || f.marketId === 'IN_ETF' || f.marketId === 'IN_BSE') && (
+              <p className="text-[11px] text-slate-600">You can enter without exchange suffix — it will be added automatically</p>
+            )}
           </div>
 
+          {/* Asset Name */}
+          <label className="block space-y-1">
+            <span className={lblCls}>Asset Name {looking && <Spinner small />}</span>
+            <input type="text" placeholder="e.g. Reliance Industries (auto-filled on lookup)" value={f.assetName}
+              onChange={e => set('assetName', e.target.value)}
+              className={inputCls + ' placeholder-slate-600'} />
+          </label>
+
+          {/* Type + Qty + Price */}
           <div className="grid grid-cols-3 gap-3">
             <label className="space-y-1">
-              <span className={labelCls}>Type</span>
+              <span className={lblCls}>Type</span>
               <select value={f.type} onChange={e => set('type', e.target.value)} className={inputCls}>
                 <option value="Buy">Buy</option>
                 <option value="Sell">Sell</option>
               </select>
             </label>
             <label className="space-y-1">
-              <span className={labelCls}>Quantity</span>
-              <input type="number" required min="0.001" step="any" placeholder="0" value={f.qty} onChange={e => set('qty', e.target.value)} className={inputCls + ' num placeholder-slate-600'} />
+              <span className={lblCls}>Quantity</span>
+              <input type="number" required min="0.001" step="any" placeholder="0" value={f.qty}
+                onChange={e => set('qty', e.target.value)} className={inputCls + ' num placeholder-slate-600'} />
             </label>
             <label className="space-y-1">
-              <span className={labelCls}>Price / Unit ({m.currency})</span>
-              <input type="number" required min="0.001" step="any" placeholder="0.00" value={f.price} onChange={e => set('price', e.target.value)} className={inputCls + ' num placeholder-slate-600'} />
+              <span className={lblCls}>Price ({m.currency})</span>
+              <input type="number" required min="0.001" step="any" placeholder="0.00" value={f.price}
+                onChange={e => set('price', e.target.value)} className={inputCls + ' num placeholder-slate-600'} />
             </label>
           </div>
 
+          {/* Total preview */}
           {f.qty && f.price && !isNaN(total) && total > 0 && (
             <div className="flex justify-between items-center bg-slate-800 rounded-xl px-4 py-3 border border-slate-700">
               <span className="text-slate-400 text-sm">Transaction Total</span>
-              <span className="font-bold text-white num text-base">{cur(total, m.currency)}</span>
+              <span className="font-bold text-white num">{cur(total, m.currency)}</span>
             </div>
           )}
 
+          {/* Priority */}
           <div className="space-y-2">
-            <span className={labelCls}>Priority Level</span>
+            <span className={lblCls}>Priority</span>
             <div className="flex items-center gap-2">
-              {[1, 2, 3, 4, 5].map(p => {
-                const active = f.priority >= p;
-                const btnCls = 'w-9 h-9 rounded-xl text-base font-medium border transition-all ' + (active ? 'bg-amber-500 border-amber-400 text-white shadow-amber-500/30 shadow-md' : 'bg-slate-800 border-slate-700 text-slate-500 hover:border-slate-500');
-                return (
-                  <button key={p} type="button" onClick={() => set('priority', p)} className={btnCls}>★</button>
-                );
-              })}
+              {[1, 2, 3, 4, 5].map(p => (
+                <button key={p} type="button" onClick={() => set('priority', p)}
+                  className={'w-9 h-9 rounded-xl text-base font-medium border transition-all ' + (f.priority >= p ? 'bg-amber-500 border-amber-400 text-white' : 'bg-slate-800 border-slate-700 text-slate-500 hover:border-slate-500')}>
+                  ★
+                </button>
+              ))}
               <span className="text-slate-400 text-sm ml-1">{f.priority} / 5</span>
             </div>
           </div>
 
+          {/* Footer */}
           <div className="flex gap-2 justify-end pt-2 border-t border-slate-800">
-            <button type="button" onClick={onClose} className="px-4 py-2 rounded-xl border border-slate-700 text-slate-300 hover:text-white hover:border-slate-500 text-sm transition-colors">
+            <button type="button" onClick={onClose} className="px-4 py-2 rounded-xl border border-slate-700 text-slate-300 hover:text-white text-sm transition-colors">
               Cancel
             </button>
             <button type="submit" className={'px-5 py-2 rounded-xl text-white text-sm font-semibold transition-colors ' + (f.type === 'Buy' ? 'bg-emerald-600 hover:bg-emerald-500' : 'bg-rose-600 hover:bg-rose-500')}>
@@ -294,27 +395,24 @@ function TxnModal({ initial, onSave, onClose }) {
   );
 }
 
-// ─── Manual Price Inline Editor ──────────────────────────────────────────
+// ─── Manual Price Cell ───────────────────────────────────────────────────
 function ManualPrice({ ticker, priceData, onSave }) {
   const [editing, setEditing] = useState(false);
   const [val, setVal]         = useState('');
-
   if (editing) {
     return (
       <span className="inline-flex items-center gap-1">
-        <input autoFocus type="number" step="any" value={val} onChange={e => setVal(e.target.value)}
-          placeholder="Price"
+        <input autoFocus type="number" step="any" value={val} onChange={e => setVal(e.target.value)} placeholder="Price"
           className="w-20 px-2 py-0.5 rounded bg-slate-800 border border-emerald-600 text-white text-xs num text-right focus:outline-none"
           onKeyDown={e => {
             if (e.key === 'Enter')  { const v = parseFloat(val); if (v > 0) onSave(v); setEditing(false); }
             if (e.key === 'Escape') setEditing(false);
           }} />
-        <button onClick={() => { const v = parseFloat(val); if (v > 0) onSave(v); setEditing(false); }} className="text-emerald-400 hover:text-emerald-300 text-xs leading-none">✓</button>
-        <button onClick={() => setEditing(false)} className="text-slate-500 hover:text-slate-300 text-xs leading-none">✕</button>
+        <button onClick={() => { const v = parseFloat(val); if (v > 0) onSave(v); setEditing(false); }} className="text-emerald-400 text-xs">✓</button>
+        <button onClick={() => setEditing(false)} className="text-slate-500 text-xs">✕</button>
       </span>
     );
   }
-
   return (
     <button onClick={() => { setVal(String((priceData && priceData.price) || '')); setEditing(true); }}
       className="text-slate-500 hover:text-slate-300 text-xs underline underline-offset-2 transition-colors">
@@ -346,20 +444,27 @@ function App() {
   const refreshPrices = useCallback(async () => {
     if (holdings.length === 0) return;
     setRefreshing(true);
-    for (const h of holdings) {
+    await Promise.all(holdings.map(async h => {
       const m = market(h.marketId);
+      // Normalize ticker in case old txns were saved without suffix
+      const ticker = normalizeTicker(h.ticker, h.marketId);
       setPrices(p => Object.assign({}, p, { [h.ticker]: Object.assign({}, p[h.ticker], { loading: true, error: null }) }));
       try {
-        const result = await fetchPrice(h.ticker, h.marketId);
-        const price = result.price, name = result.name;
-        setPrices(p => Object.assign({}, p, { [h.ticker]: { price, currency: m.currency, updatedAt: new Date().toISOString(), loading: false, error: null, manual: false } }));
+        const { price, name } = await fetchPrice(ticker, h.marketId);
+        setPrices(p => Object.assign({}, p, {
+          [h.ticker]: { price, currency: m.currency, updatedAt: new Date().toISOString(), loading: false, error: null, manual: false },
+        }));
         if (name) {
-          setTxns(prev => prev.map(t => t.ticker === h.ticker && t.assetName === t.ticker ? Object.assign({}, t, { assetName: name }) : t));
+          setTxns(prev => prev.map(t =>
+            t.ticker === h.ticker ? Object.assign({}, t, { assetName: name }) : t
+          ));
         }
       } catch (err) {
-        setPrices(p => Object.assign({}, p, { [h.ticker]: Object.assign({}, p[h.ticker], { loading: false, error: String(err.message).slice(0, 60) }) }));
+        setPrices(p => Object.assign({}, p, {
+          [h.ticker]: Object.assign({}, p[h.ticker], { loading: false, error: String(err.message) }),
+        }));
       }
-    }
+    }));
     setRefreshing(false);
   }, [holdings]);
 
@@ -371,16 +476,16 @@ function App() {
   }, [holdings.length]);
 
   const totals = useMemo(() => {
-    const bySymbol = {};
+    const bySym = {};
     for (const h of holdings) {
       const m  = market(h.marketId);
       const pd = prices[h.ticker];
-      if (!bySymbol[m.currency]) bySymbol[m.currency] = { invested: 0, value: 0, sym: m.currency, complete: true };
-      bySymbol[m.currency].invested += h.cost;
-      if (pd && pd.price) bySymbol[m.currency].value += h.qty * pd.price;
-      else                bySymbol[m.currency].complete = false;
+      if (!bySym[m.currency]) bySym[m.currency] = { invested: 0, value: 0, sym: m.currency, complete: true };
+      bySym[m.currency].invested += h.cost;
+      if (pd && pd.price) bySym[m.currency].value += h.qty * pd.price;
+      else bySym[m.currency].complete = false;
     }
-    return Object.values(bySymbol).map(g => Object.assign({}, g, {
+    return Object.values(bySym).map(g => Object.assign({}, g, {
       pl:    g.value - g.invested,
       plPct: g.invested > 0 ? ((g.value - g.invested) / g.invested) * 100 : 0,
     }));
@@ -392,13 +497,15 @@ function App() {
       : [...prev, record]
     );
     setModal(null);
-    if (!prices[record.ticker]) {
-      const m = market(record.marketId);
-      setPrices(p => Object.assign({}, p, { [record.ticker]: { loading: true } }));
-      fetchPrice(record.ticker, record.marketId)
-        .then(result => setPrices(p => Object.assign({}, p, { [record.ticker]: { price: result.price, currency: m.currency, updatedAt: new Date().toISOString(), loading: false, error: null, manual: false } })))
-        .catch(err => setPrices(p => Object.assign({}, p, { [record.ticker]: Object.assign({}, p[record.ticker], { loading: false, error: String(err.message) }) })));
-    }
+    const m = market(record.marketId);
+    const ticker = normalizeTicker(record.ticker, record.marketId);
+    setPrices(p => Object.assign({}, p, { [record.ticker]: { loading: true } }));
+    fetchPrice(ticker, record.marketId)
+      .then(({ price, name }) => {
+        setPrices(p => Object.assign({}, p, { [record.ticker]: { price, currency: m.currency, updatedAt: new Date().toISOString(), loading: false, error: null, manual: false } }));
+        if (name) setTxns(prev => prev.map(t => t.ticker === record.ticker ? Object.assign({}, t, { assetName: name }) : t));
+      })
+      .catch(err => setPrices(p => Object.assign({}, p, { [record.ticker]: Object.assign({}, p[record.ticker], { loading: false, error: String(err.message) }) })));
   }
 
   function deleteTxn(id) {
@@ -414,10 +521,11 @@ function App() {
 
   return (
     <div className="min-h-screen bg-slate-950">
+      {/* Header */}
       <header className="sticky top-0 z-20 bg-slate-950/95 backdrop-blur border-b border-slate-800">
         <div className="max-w-6xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-4">
           <div className="flex items-center gap-3 min-w-0">
-            <div className="h-9 w-9 rounded-xl bg-gradient-to-br from-emerald-500 to-teal-600 grid place-items-center text-white font-black text-sm shrink-0 shadow-emerald-500/30 shadow-md">W</div>
+            <div className="h-9 w-9 rounded-xl bg-gradient-to-br from-emerald-500 to-teal-600 grid place-items-center text-white font-black text-sm shrink-0">W</div>
             <div className="min-w-0">
               <h1 className="font-bold text-base leading-tight truncate">Wealth Portfolio</h1>
               <p className="text-slate-500 text-[11px] leading-tight hidden sm:block">Multi-asset tracker · IN &amp; US Markets</p>
@@ -425,15 +533,15 @@ function App() {
           </div>
           <div className="flex items-center gap-2 shrink-0">
             <a href="index.html" className="hidden sm:inline-flex items-center gap-1 text-slate-400 hover:text-slate-200 text-xs px-3 py-1.5 rounded-lg border border-slate-800 hover:border-slate-600 transition-colors">
-              ← Budget Tracker
+              ← Budget
             </a>
             <button onClick={refreshPrices} disabled={refreshing || holdings.length === 0}
               className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 transition-colors disabled:opacity-40">
               {refreshing ? <Spinner /> : <span className="text-base leading-none">↻</span>}
-              <span className="hidden sm:inline">Refresh Prices</span>
+              <span className="hidden sm:inline">Refresh</span>
             </button>
             <button onClick={() => setModal('add')}
-              className="flex items-center gap-1.5 text-xs sm:text-sm px-3 sm:px-4 py-1.5 sm:py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-semibold transition-colors shadow-emerald-600/25 shadow-md">
+              className="flex items-center gap-1.5 text-xs sm:text-sm px-3 sm:px-4 py-1.5 sm:py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-semibold transition-colors">
               + <span className="hidden sm:inline">Add Transaction</span><span className="sm:hidden">Add</span>
             </button>
           </div>
@@ -442,13 +550,14 @@ function App() {
 
       <main className="max-w-6xl mx-auto px-4 sm:px-6 py-6 space-y-6">
 
+        {/* Summary Cards */}
         {totals.length > 0 && (
           <section className="space-y-3">
             {totals.map(g => (
               <div key={g.sym} className="grid grid-cols-2 sm:grid-cols-4 gap-3">
                 <StatCard label={'Portfolio Value (' + g.sym + ')'} accent>
                   <p className="text-3xl font-black num text-white tracking-tight">{cur(g.value, g.sym)}</p>
-                  {!g.complete && <p className="text-amber-500 text-xs mt-1">⚠ Some prices pending</p>}
+                  {!g.complete && <p className="text-amber-500 text-xs mt-1">⚠ Some prices loading</p>}
                 </StatCard>
                 <StatCard label="Total Invested">
                   <p className="text-2xl font-bold num text-slate-200">{cur(g.invested, g.sym)}</p>
@@ -469,21 +578,18 @@ function App() {
           </section>
         )}
 
+        {/* Tab Bar */}
         <div className="flex gap-1 bg-slate-900/80 rounded-xl p-1 w-fit border border-slate-800">
-          {[
-            { id: 'holdings',     label: 'Holdings',     count: holdings.length },
-            { id: 'transactions', label: 'Transactions', count: txns.length },
-          ].map(t => (
+          {[{ id: 'holdings', label: 'Holdings', count: holdings.length }, { id: 'transactions', label: 'Transactions', count: txns.length }].map(t => (
             <button key={t.id} onClick={() => setTab(t.id)}
               className={'px-4 py-1.5 rounded-lg text-sm font-medium transition-all ' + (tab === t.id ? 'bg-slate-700 text-white shadow' : 'text-slate-400 hover:text-slate-200')}>
               {t.label}
-              {t.count > 0 && (
-                <span className={'ml-1.5 text-[11px] px-1.5 py-0.5 rounded-full ' + (tab === t.id ? 'bg-slate-600 text-slate-200' : 'bg-slate-800 text-slate-500')}>{t.count}</span>
-              )}
+              {t.count > 0 && <span className={'ml-1.5 text-[11px] px-1.5 py-0.5 rounded-full ' + (tab === t.id ? 'bg-slate-600 text-slate-200' : 'bg-slate-800 text-slate-500')}>{t.count}</span>}
             </button>
           ))}
         </div>
 
+        {/* Holdings Table */}
         {tab === 'holdings' && (
           holdings.length === 0
             ? <EmptyState onAdd={() => setModal('add')} />
@@ -502,7 +608,7 @@ function App() {
                       {holdings.map(h => {
                         const m   = market(h.marketId);
                         const pd  = prices[h.ticker];
-                        const lp  = (pd && pd.price) ? pd.price : null;
+                        const lp  = pd && pd.price ? pd.price : null;
                         const cv  = lp != null ? h.qty * lp : null;
                         const pl  = cv != null ? cv - h.cost : null;
                         const pct = pl != null && h.cost > 0 ? (pl / h.cost) * 100 : null;
@@ -521,11 +627,17 @@ function App() {
                             <td className="px-4 py-4 text-right num text-slate-300 font-medium">{qty(h.qty)}</td>
                             <td className="px-4 py-4 text-right num text-slate-300">{cur(h.avgBuy, m.currency)}</td>
                             <td className="px-4 py-4 text-right">
-                              {(pd && pd.loading)
+                              {pd && pd.loading
                                 ? <span className="text-slate-500 text-xs animate-pulse">fetching…</span>
                                 : lp != null
-                                  ? <span className="num font-semibold text-white">{cur(lp, m.currency)}</span>
-                                  : <span className="text-slate-600 text-xs">{(pd && pd.error) ? '⚠ error' : '—'}</span>
+                                  ? <div>
+                                      <span className="num font-semibold text-white">{cur(lp, m.currency)}</span>
+                                      {pd && pd.updatedAt && <div className="text-[10px] text-slate-600">{new Date(pd.updatedAt).toLocaleTimeString()}</div>}
+                                    </div>
+                                  : <div>
+                                      <span className="text-rose-400 text-xs">⚠ error</span>
+                                      {pd && pd.error && <div className="text-[10px] text-slate-600 max-w-[120px] truncate" title={pd.error}>{pd.error}</div>}
+                                    </div>
                               }
                             </td>
                             <td className="px-4 py-4 text-right num font-semibold">
@@ -546,7 +658,6 @@ function App() {
                         );
                       })}
                     </tbody>
-
                     {totals.map(g => (
                       <tfoot key={g.sym} className="border-t-2 border-slate-700 bg-slate-800/50">
                         <tr>
@@ -562,20 +673,22 @@ function App() {
                     ))}
                   </table>
                 </div>
-
+                {/* Error hint */}
                 {holdings.some(h => prices[h.ticker] && prices[h.ticker].error) && (
-                  <div className="px-5 py-3 border-t border-slate-800 flex items-start gap-2 text-amber-500 text-xs">
-                    <span className="mt-0.5 shrink-0">⚠</span>
-                    <span>
-                      Some prices failed to load (possible CORS restriction).
-                      Use <strong>set price</strong> to enter prices manually, or MF NAV via mfapi.in usually works fine.
-                    </span>
+                  <div className="px-5 py-3 border-t border-slate-800 text-amber-400 text-xs space-y-1">
+                    <p>⚠ One or more prices failed. Tips:</p>
+                    <ul className="list-disc list-inside text-slate-400 space-y-0.5 ml-2">
+                      <li>Make sure the ticker includes the exchange suffix (e.g. <strong>NIFTYBEES.NS</strong>)</li>
+                      <li>Use <strong>set price</strong> to enter the current price manually</li>
+                      <li>Mutual Fund NAV: use MF scheme code with market "Indian Mutual Fund"</li>
+                    </ul>
                   </div>
                 )}
               </div>
             )
         )}
 
+        {/* Transactions Table */}
         {tab === 'transactions' && (
           txns.length === 0
             ? <EmptyState onAdd={() => setModal('add')} />
@@ -592,10 +705,9 @@ function App() {
                     </thead>
                     <tbody className="divide-y divide-slate-800/60">
                       {sortedTxns.map(t => {
-                        const m     = market(t.marketId);
+                        const m = market(t.marketId);
                         const total = t.qty * t.price;
                         const stars = '★'.repeat(t.priority) + '☆'.repeat(5 - t.priority);
-                        const typeCls = 'text-xs font-bold px-2.5 py-1 rounded-full border ' + (t.type === 'Buy' ? 'text-emerald-400 bg-emerald-950 border-emerald-800' : 'text-rose-400 bg-rose-950 border-rose-800');
                         return (
                           <tr key={t.id} className="hover:bg-slate-800/40 transition-colors group">
                             <td className="px-4 py-3.5 text-slate-300 whitespace-nowrap num">{t.date}</td>
@@ -605,7 +717,9 @@ function App() {
                             </td>
                             <td className="px-4 py-3.5 text-xs text-slate-400 whitespace-nowrap">{m.label}</td>
                             <td className="px-4 py-3.5">
-                              <span className={typeCls}>{t.type === 'Buy' ? '▲ ' : '▼ '}{t.type}</span>
+                              <span className={'text-xs font-bold px-2.5 py-1 rounded-full border ' + (t.type === 'Buy' ? 'text-emerald-400 bg-emerald-950 border-emerald-800' : 'text-rose-400 bg-rose-950 border-rose-800')}>
+                                {t.type === 'Buy' ? '▲ ' : '▼ '}{t.type}
+                              </span>
                             </td>
                             <td className="px-4 py-3.5 text-right num text-slate-200">{qty(t.qty)}</td>
                             <td className="px-4 py-3.5 text-right num text-slate-200">{cur(t.price, m.currency)}</td>
@@ -631,7 +745,7 @@ function App() {
       </main>
 
       <footer className="text-center text-slate-700 text-xs py-10 border-t border-slate-900 mt-10">
-        <p>Live prices: Yahoo Finance (stocks/ETFs) · MFapi.in (Indian MF NAV)</p>
+        <p>Prices via Stooq · Yahoo Finance (proxied) · MFapi.in (MF NAV)</p>
         <p className="mt-1">All data stored locally in your browser · Amma Kanakku Wealth Portfolio</p>
       </footer>
 
@@ -646,9 +760,7 @@ function App() {
   );
 }
 
-ReactDOM.createRoot(document.getElementById('root')).render(
-  <ErrBound><App /></ErrBound>
-);
+ReactDOM.createRoot(document.getElementById('root')).render(<ErrBound><App /></ErrBound>);
   </script>
 </body>
 </html>
